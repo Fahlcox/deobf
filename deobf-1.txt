@@ -1,0 +1,1138 @@
+local L = loadstring
+local RI = Instance
+local G = (getgenv and getgenv()) or getfenv(1)
+local tof = typeof or type
+local wrap = newcclosure or function(f) return f end
+local chk = checkcaller or function() return true end
+local setm = setnamecallmethod or function() end
+local uis = game:GetService("UserInputService")
+
+local PAGE, MAXEV, WINDOW, LIMIT = 10000, 4000, 12, 600
+local MODES = {"safe", "safe+get", "live"}
+local S = {mode = 1, gc = false, tidy = true, on = false, mute = false, run = false, stop = false}
+local log, lay, lidx, refs, fake, roots = {}, {}, {}, {}, {}, {}
+local cnt = {i = 0, f = 0, r = 0, v = 0, g = 0, s = 0}
+local vs, vi, pi, pg = {{"trace", "paste a raw link or source above and press run"}}, 1, 1, {""}
+local tc = {}
+
+local KW = {}
+for w in ("and break do else elseif end false for function goto if in local nil not or repeat return then true until while"):gmatch("%a+") do KW[w] = true end
+local OP3 = {["..."] = 1, ["..="] = 1, ["//="] = 1}
+local OP2 = {}
+for w in ("== ~= <= >= // :: -> += -= *= /= %= ^= .."):gmatch("%S+") do OP2[w] = 1 end
+
+local function lex(s)
+    local T, K, n, i, len = {}, {}, 0, 1, #s
+    local function add(t, k)
+        n = n + 1
+        T[n], K[n] = t, k
+    end
+    while i <= len do
+        local c, e = s:sub(i, i), nil
+        if c:find("%s") then
+            i = s:find("%S", i) or len + 1
+        elseif s:find("^%-%-", i) then
+            local lv = s:match("^%-%-%[(=*)%[", i)
+            if lv then
+                e = select(2, s:find("]" .. lv .. "]", i, true)) or len
+            else
+                e = (s:find("\n", i, true) or len + 1) - 1
+            end
+            add(s:sub(i, e), "c")
+            i = e + 1
+        elseif c == '"' or c == "'" or c == "`" then
+            local j = i + 1
+            while j <= len do
+                local a = s:find("[\\" .. c .. "\n]", j)
+                if not a then
+                    j = len + 1
+                    break
+                end
+                if s:sub(a, a) == "\\" then
+                    j = a + 2
+                else
+                    j = a + 1
+                    break
+                end
+            end
+            add(s:sub(i, j - 1), "s")
+            i = j
+        elseif c == "[" and s:find("^%[=*%[", i) then
+            local lv = s:match("^%[(=*)%[", i)
+            e = select(2, s:find("]" .. lv .. "]", i, true)) or len
+            add(s:sub(i, e), "s")
+            i = e + 1
+        elseif c:find("%d") or (c == "." and s:find("^%.%d", i)) then
+            if s:find("^0[xX]", i) then
+                e = select(2, s:find("^0[xX][%x_]*", i))
+            elseif s:find("^0[bB]", i) then
+                e = select(2, s:find("^0[bB][01_]*", i))
+            else
+                e = select(2, s:find("^[%d_]*%.?[%d_]*", i))
+                e = select(2, s:find("^[eE][+-]?%d+", e + 1)) or e
+            end
+            add(s:sub(i, e), "d")
+            i = e + 1
+        elseif c:find("[%a_]") then
+            e = select(2, s:find("^[%a_][%w_]*", i))
+            local w = s:sub(i, e)
+            add(w, KW[w] and "k" or "n")
+            i = e + 1
+        else
+            local t3, t2 = s:sub(i, i + 2), s:sub(i, i + 1)
+            local t = OP3[t3] and t3 or OP2[t2] and t2 or c
+            add(t, "o")
+            i = i + #t
+        end
+    end
+    return T, K
+end
+
+local ESC = {n = "\n", t = "\t", r = "\r", a = "\a", b = "\b", f = "\f", v = "\v", ["\\"] = "\\", ['"'] = '"', ["'"] = "'", ["\n"] = "\n"}
+
+local function unq(t)
+    local q = t:sub(1, 1)
+    if #t < 2 or (q ~= '"' and q ~= "'") or t:sub(-1) ~= q then return nil end
+    local b = t:sub(2, -2)
+    if not b:find("\\", 1, true) then return b end
+    local out, i = {}, 1
+    while true do
+        local a = b:find("\\", i, true)
+        if not a then
+            out[#out + 1] = b:sub(i)
+            break
+        end
+        out[#out + 1] = b:sub(i, a - 1)
+        local c = b:sub(a + 1, a + 1)
+        if c:find("%d") then
+            local d = b:match("^%d%d?%d?", a + 1)
+            local v = tonumber(d)
+            if v > 255 then return nil end
+            out[#out + 1] = string.char(v)
+            i = a + 1 + #d
+        elseif c == "x" then
+            local h = b:match("^%x%x", a + 2)
+            if not h then return nil end
+            out[#out + 1] = string.char(tonumber(h, 16))
+            i = a + 4
+        elseif c == "z" then
+            i = b:find("%S", a + 2) or #b + 1
+        elseif c == "u" then
+            local h = b:match("^{(%x+)}", a + 2)
+            local cp = h and tonumber(h, 16)
+            if not cp or cp > 0x10FFFF then return nil end
+            out[#out + 1] = utf8.char(cp)
+            i = a + 4 + #h
+        elseif ESC[c] then
+            out[#out + 1] = ESC[c]
+            i = a + 2
+        else
+            return nil
+        end
+    end
+    return table.concat(out)
+end
+
+local function req(v)
+    local q = '"'
+    if v:find('"', 1, true) and not v:find("'", 1, true) then q = "'" end
+    local ok = utf8.len(v)
+    local r = v:gsub("[%c\"'\\\128-\255]", function(c)
+        if c == q or c == "\\" then return "\\" .. c end
+        if c == "\n" then return "\\n" end
+        if c == "\t" then return "\\t" end
+        if c == "\r" then return "\\r" end
+        local b = c:byte()
+        if b > 127 then return ok and c or string.format("\\%03d", b) end
+        if b < 32 or b == 127 then return string.format("\\%03d", b) end
+        return c
+    end)
+    return q .. r .. q
+end
+
+local function nums(T, K)
+    for i = 1, #T do
+        if K[i] == "d" then
+            local t = T[i]:gsub("_", "")
+            local v
+            if t:find("^0[xX]%x+$") then v = tonumber(t)
+            elseif t:find("^0[bB][01]+$") then v = tonumber(t:sub(3), 2) end
+            if v and v < 2 ^ 53 then T[i] = string.format("%d", v) end
+        end
+    end
+end
+
+local function strs(T, K)
+    for i = 1, #T do
+        if K[i] == "s" then
+            local v = unq(T[i])
+            if v then T[i] = req(v) end
+        end
+    end
+end
+
+local function chars(T, K)
+    local A, B, n, i, N = {}, {}, 0, 1, #T
+    while i <= N do
+        local hit
+        if T[i] == "string" and T[i + 1] == "." and T[i + 2] == "char" and T[i + 3] == "(" then
+            local j, cs = i + 4, {}
+            while true do
+                local v = K[j] == "d" and tonumber(T[j])
+                if not v or v % 1 ~= 0 or v < 0 or v > 255 then break end
+                cs[#cs + 1] = string.char(v)
+                if T[j + 1] == "," then
+                    j = j + 2
+                elseif T[j + 1] == ")" then
+                    n = n + 1
+                    A[n], B[n] = req(table.concat(cs)), "s"
+                    i, hit = j + 2, true
+                    break
+                else
+                    break
+                end
+            end
+        end
+        if not hit then
+            n = n + 1
+            A[n], B[n] = T[i], K[i]
+            i = i + 1
+        end
+    end
+    return A, B
+end
+
+local TIGHT = {["#"] = 1, ["-"] = 1, ["not"] = 1, ["*"] = 1, ["/"] = 1, ["%"] = 1, ["^"] = 1, ["//"] = 1, ["+"] = 1}
+
+local function joins(T, K)
+    local again = true
+    while again do
+        again = false
+        local A, B, n, i, N = {}, {}, 0, 1, #T
+        while i <= N do
+            local a, b
+            if K[i] == "s" and T[i + 1] == ".." and K[i + 2] == "s" and not TIGHT[A[n] or ""] and not TIGHT[T[i + 3] or ""] then
+                a, b = unq(T[i]), unq(T[i + 2])
+            end
+            n = n + 1
+            if a and b then
+                A[n], B[n] = req(a .. b), "s"
+                i = i + 3
+                again = true
+            else
+                A[n], B[n] = T[i], K[i]
+                i = i + 1
+            end
+        end
+        T, K = A, B
+    end
+    return T, K
+end
+
+local function junk(w)
+    return w:find("^_0x%x+$") or (#w >= 3 and w:find("^[Il1O0_]+$") and not w:find("^_+$"))
+end
+
+local function rename(T, K)
+    local used, map, k = {}, {}, 0
+    for i = 1, #T do
+        if K[i] == "n" then used[T[i]] = true end
+    end
+    for i = 1, #T do
+        local w = T[i]
+        if K[i] == "n" and junk(w) then
+            if not map[w] then
+                repeat k = k + 1 until not used["v" .. k]
+                map[w] = "v" .. k
+            end
+            T[i] = map[w]
+        end
+    end
+end
+
+local function ve(t, k)
+    return k == "n" or k == "d" or k == "s" or t == ")" or t == "]" or t == "}" or t == "end" or t == "nil" or t == "true" or t == "false" or t == "..."
+end
+
+local function gap(a, ak, b, un)
+    if un then return false end
+    if b == "," or b == ";" or b == ")" or b == "]" or b == "." or b == ":" or b == "::" then return false end
+    if a == "(" or a == "[" or a == "." or a == ":" or a == "#" or a == "::" then return false end
+    if (b == "(" or b == "[") and (ak == "n" or ak == "s" or a == ")" or a == "]" or a == "}") then return false end
+    if a == "{" and b == "}" then return false end
+    return true
+end
+
+local HEAD = {["local"] = 1, ["for"] = 1, ["while"] = 1, ["return"] = 1, ["break"] = 1, ["goto"] = 1}
+
+local function lay_out(T, K)
+    local N, pc = #T, {}
+    for i = 1, N do
+        if T[i] == "function" and K[i] == "k" then
+            local j, d = i + 1, 0
+            while j <= N and T[j] ~= "(" do j = j + 1 end
+            while j <= N do
+                if T[j] == "(" then
+                    d = d + 1
+                elseif T[j] == ")" then
+                    d = d - 1
+                    if d == 0 then
+                        pc[j] = true
+                        break
+                    end
+                end
+                j = j + 1
+            end
+        end
+    end
+    local out, cur, ind, bd, st = {}, "", 0, 0, {}
+    local pt, pk, un
+    local function brk()
+        if cur ~= "" then
+            out[#out + 1] = string.rep("    ", ind) .. cur
+            cur = ""
+        end
+        pt, pk, un = nil, nil, false
+    end
+    for i = 1, N do
+        local t, k = T[i], K[i]
+        if k == "c" then
+            brk()
+            out[#out + 1] = string.rep("    ", ind) .. t
+        elseif t == ";" and bd == 0 then
+            brk()
+        else
+            local open
+            if k == "k" then
+                if t == "end" or t == "until" then
+                    table.remove(st)
+                    ind = math.max(ind - 1, 0)
+                    brk()
+                elseif t == "else" or t == "elseif" then
+                    if st[#st] == "e" then
+                        if t == "else" then table.remove(st) end
+                    else
+                        ind = math.max(ind - 1, 0)
+                        brk()
+                        open = t == "else"
+                    end
+                elseif t == "if" then
+                    local ex = pt ~= nil and not ve(pt, pk)
+                    st[#st + 1] = ex and "e" or "s"
+                    if not ex then brk() end
+                elseif t == "then" then
+                    open = st[#st] ~= "e"
+                elseif t == "do" then
+                    st[#st + 1] = "b"
+                    open = true
+                elseif t == "repeat" then
+                    brk()
+                    st[#st + 1] = "r"
+                    open = true
+                elseif t == "function" then
+                    st[#st + 1] = "f"
+                    if pt and ve(pt, pk) then brk() end
+                elseif HEAD[t] then
+                    brk()
+                end
+            elseif k == "n" and pt and ve(pt, pk) then
+                brk()
+            end
+            local sep = (cur ~= "" and gap(pt, pk, t, un)) and " " or ""
+            cur = cur .. sep .. t
+            un = (t == "-" and (pt == nil or not ve(pt, pk))) or t == "#"
+            pt, pk = t, k
+            if t == "{" then bd = bd + 1 elseif t == "}" then bd = math.max(bd - 1, 0) end
+            if open or pc[i] then
+                brk()
+                ind = ind + 1
+            end
+        end
+    end
+    brk()
+    return table.concat(out, "\n")
+end
+
+local function tidy(src)
+    if #src > 1500000 then return src end
+    local T, K = lex(src)
+    nums(T, K)
+    strs(T, K)
+    T, K = chars(T, K)
+    T, K = joins(T, K)
+    rename(T, K)
+    return lay_out(T, K)
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "deob"
+gui.ResetOnSpawn = false
+local host = (gethui and gethui()) or game:GetService("CoreGui")
+if not pcall(function()
+    local o = host:FindFirstChild("deob")
+    if o then o:Destroy() end
+    gui.Parent = host
+end) then
+    gui.Parent = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local main = Instance.new("Frame")
+main.Position = UDim2.new(0.2, 0, 0.1, 0)
+main.Size = UDim2.new(0.6, 0, 0.8, 0)
+main.Active = true
+main.Parent = gui
+
+local lim = Instance.new("UISizeConstraint")
+lim.MinSize = Vector2.new(330, 270)
+lim.MaxSize = Vector2.new(560, 430)
+lim.Parent = main
+
+local function el(cls, y, a, b, txt, h)
+    local o = Instance.new(cls)
+    o.Position = UDim2.new(a, 2, 0, y)
+    o.Size = UDim2.new(b - a, -4, 0, h or 24)
+    if txt then o.Text = txt end
+    o.Parent = main
+    return o
+end
+
+local title = el("TextLabel", 0, 0, 0.9, "deob")
+local close = el("TextButton", 0, 0.9, 1, "x")
+
+local inp = el("TextBox", 28, 0, 1, "")
+inp.PlaceholderText = "raw link or source"
+inp.MultiLine = true
+inp.ClearTextOnFocus = false
+inp.ClipsDescendants = true
+inp.TextXAlignment = Enum.TextXAlignment.Left
+inp.TextYAlignment = Enum.TextYAlignment.Top
+
+local nameB = el("TextBox", 56, 0, 0.26, "deobfuscated")
+nameB.ClearTextOnFocus = false
+local runB = el("TextButton", 56, 0.26, 0.42, "run")
+local modeB = el("TextButton", 56, 0.42, 0.64, "safe")
+local gcB = el("TextButton", 56, 0.64, 0.82, "gc off")
+local tidyB = el("TextButton", 56, 0.82, 1, "tidy on")
+
+local prev = el("TextButton", 84, 0, 0.12, "<")
+local label = el("TextButton", 84, 0.12, 0.55, "trace")
+local nxt = el("TextButton", 84, 0.55, 0.67, ">")
+local copyB = el("TextButton", 84, 0.67, 0.835, "copy")
+local saveB = el("TextButton", 84, 0.835, 1, "save")
+
+local status = el("TextLabel", 112, 0, 1, "idle", 18)
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextTruncate = Enum.TextTruncate.AtEnd
+
+local sf = Instance.new("ScrollingFrame")
+sf.Position = UDim2.new(0, 4, 0, 134)
+sf.Size = UDim2.new(1, -8, 1, -138)
+sf.ClipsDescendants = true
+sf.CanvasSize = UDim2.new()
+sf.ScrollBarThickness = 10
+sf.ScrollingDirection = Enum.ScrollingDirection.XY
+sf.Parent = main
+
+local box = Instance.new("TextBox")
+box.Position = UDim2.new()
+box.Size = UDim2.fromOffset(10, 10)
+box.MultiLine = true
+box.TextWrapped = false
+box.ClearTextOnFocus = false
+box.Font = Enum.Font.Code
+box.TextSize = 13
+box.TextXAlignment = Enum.TextXAlignment.Left
+box.TextYAlignment = Enum.TextYAlignment.Top
+box.Text = ""
+box.Parent = sf
+
+local function fit()
+    local b = box.TextBounds
+    local w = math.max(b.X + 12, sf.AbsoluteSize.X - 12)
+    local h = math.max(b.Y + 12, sf.AbsoluteSize.Y - 12)
+    box.Size = UDim2.fromOffset(w, h)
+    sf.CanvasSize = UDim2.fromOffset(w, h)
+end
+box:GetPropertyChangedSignal("TextBounds"):Connect(fit)
+sf:GetPropertyChangedSignal("AbsoluteSize"):Connect(fit)
+
+local drag, d0, p0
+title.InputBegan:Connect(function(i)
+    local u = i.UserInputType
+    if u == Enum.UserInputType.MouseButton1 or u == Enum.UserInputType.Touch then
+        drag, d0, p0 = true, i.Position, main.Position
+        i.Changed:Connect(function()
+            if i.UserInputState == Enum.UserInputState.End then drag = false end
+        end)
+    end
+end)
+local mv = uis.InputChanged:Connect(function(i)
+    local u = i.UserInputType
+    if drag and (u == Enum.UserInputType.MouseMovement or u == Enum.UserInputType.Touch) then
+        local d = i.Position - d0
+        main.Position = UDim2.new(p0.X.Scale, p0.X.Offset + d.X, p0.Y.Scale, p0.Y.Offset + d.Y)
+    end
+end)
+
+local function say(t) status.Text = t end
+
+local function clean(s)
+    s = s:gsub("\r", "")
+    s = s:gsub("%c", function(c)
+        if c == "\n" or c == "\t" then return c end
+        return "\\" .. c:byte()
+    end)
+    if utf8.len(s) then return s end
+    return (s:gsub("[\128-\255]", function(c) return "\\" .. c:byte() end))
+end
+
+local function pages(s)
+    local o, buf, n = {}, {}, 0
+    local function out()
+        if #buf > 0 then
+            o[#o + 1] = table.concat(buf, "\n")
+            buf, n = {}, 0
+        end
+    end
+    for ln in (s .. "\n"):gmatch("(.-)\n") do
+        local l = ln
+        while #l > PAGE do
+            out()
+            o[#o + 1] = l:sub(1, PAGE)
+            l = l:sub(PAGE + 1)
+        end
+        if n + #l > PAGE then out() end
+        buf[#buf + 1] = l
+        n = n + #l + 1
+    end
+    out()
+    if #o == 0 then o[1] = "" end
+    return o
+end
+
+local function shown(v)
+    if not (S.tidy and v[3]) then return v[2] end
+    local r = tc[v[2]]
+    if not r then
+        local ok, x = pcall(tidy, v[2])
+        r = ok and x or v[2]
+        tc[v[2]] = r
+    end
+    return r
+end
+
+local function render()
+    local v = vs[vi]
+    pg = pages(shown(v))
+    pi = math.min(math.max(pi, 1), #pg)
+    box.Text = clean(pg[pi])
+    label.Text = v[1]:sub(1, 22) .. ((v[3] and S.tidy) and "*" or "") .. " " .. pi .. "/" .. #pg
+    sf.CanvasPosition = Vector2.new(0, 0)
+end
+
+local function step(d)
+    if d > 0 then
+        if pi < #pg then
+            pi = pi + 1
+        elseif vi < #vs then
+            vi, pi = vi + 1, 1
+        end
+    else
+        if pi > 1 then
+            pi = pi - 1
+        elseif vi > 1 then
+            vi = vi - 1
+            pi = #pages(shown(vs[vi]))
+        end
+    end
+    render()
+end
+
+local function quote(s)
+    return (string.format("%q", s):gsub("\\\n", "\\n"))
+end
+
+local function num(n)
+    if n ~= n then return "0/0" end
+    if n == math.huge then return "math.huge" end
+    if n == -math.huge then return "-math.huge" end
+    return string.format("%.14g", n)
+end
+
+local function addl(tag, text)
+    local k = lidx[text]
+    if not k then
+        k = #lay + 1
+        lay[k] = {tag, text}
+        lidx[text] = k
+    end
+    return k
+end
+
+local function path(i)
+    local p, c = {}, i
+    while c and c ~= game do
+        p[#p + 1] = c.Name
+        c = c.Parent
+    end
+    if c ~= game then return nil end
+    local s = "game"
+    for k = #p, 1, -1 do
+        local n = p[k]
+        s = s .. (n:find("^[%a_][%w_]*$") and ("." .. n) or ("[" .. quote(n) .. "]"))
+    end
+    return s
+end
+
+local fmt
+fmt = function(v, d)
+    d = d or 0
+    local p = fake[v]
+    if p then return p.name end
+    local t = tof(v)
+    if t == "string" then
+        if #v > 250 then return "layer" .. addl("string", v) end
+        return quote(v)
+    elseif t == "number" then
+        return num(v)
+    elseif t == "Instance" then
+        return refs[v] or path(v) or ("Instance<" .. v.ClassName .. ">")
+    elseif t == "Vector3" then
+        return "Vector3.new(" .. num(v.X) .. ", " .. num(v.Y) .. ", " .. num(v.Z) .. ")"
+    elseif t == "Vector2" then
+        return "Vector2.new(" .. num(v.X) .. ", " .. num(v.Y) .. ")"
+    elseif t == "Color3" then
+        return "Color3.new(" .. num(v.R) .. ", " .. num(v.G) .. ", " .. num(v.B) .. ")"
+    elseif t == "UDim2" then
+        return "UDim2.new(" .. num(v.X.Scale) .. ", " .. num(v.X.Offset) .. ", " .. num(v.Y.Scale) .. ", " .. num(v.Y.Offset) .. ")"
+    elseif t == "UDim" then
+        return "UDim.new(" .. num(v.Scale) .. ", " .. num(v.Offset) .. ")"
+    elseif t == "CFrame" then
+        local c = {v:GetComponents()}
+        for k = 1, #c do c[k] = num(c[k]) end
+        return "CFrame.new(" .. table.concat(c, ", ") .. ")"
+    elseif t == "function" then
+        return "function() end"
+    elseif t == "table" then
+        if d > 3 then return "{}" end
+        local o, n, ai = {}, 0, 0
+        for k, x in next, v do
+            n = n + 1
+            if n > 40 then
+                o[#o + 1] = "..."
+                break
+            end
+            if k == ai + 1 then
+                ai = k
+                o[#o + 1] = fmt(x, d + 1)
+            elseif type(k) == "string" and k:find("^[%a_][%w_]*$") then
+                o[#o + 1] = k .. " = " .. fmt(x, d + 1)
+            else
+                o[#o + 1] = "[" .. fmt(k, d + 1) .. "] = " .. fmt(x, d + 1)
+            end
+        end
+        return "{" .. table.concat(o, ", ") .. "}"
+    end
+    return tostring(v)
+end
+
+local function args(...)
+    local t = {}
+    for i = 1, select("#", ...) do t[i] = fmt((select(i, ...))) end
+    return table.concat(t, ", ")
+end
+
+local function emit(s)
+    if not S.on then return end
+    local n = #log
+    if n >= MAXEV then
+        if n == MAXEV then log[n + 1] = 'error("event limit")' end
+        return
+    end
+    log[n + 1] = s
+    if n % 50 == 49 then say("tracing " .. (n + 1)) end
+end
+
+local function tick()
+    cnt.s = cnt.s + 1
+    if cnt.s > LIMIT then error("trace limit") end
+end
+
+local function loader(e)
+    return wrap(function(s, c)
+        if fake[s] then return function() end end
+        local f, err = L(s, c)
+        if not f then return nil, err end
+        pcall(setfenv, f, e)
+        if not S.on or S.mute then return f end
+        cnt.f = cnt.f + 1
+        local n = "f" .. cnt.f
+        emit("local " .. n .. " = loadstring(layer" .. addl("loadstring", s) .. ")")
+        return function(...)
+            emit(n .. "(" .. args(...) .. ")")
+            return f(...)
+        end
+    end)
+end
+
+local pm = {}
+
+local function proxy(name, parent, key)
+    local p = setmetatable({}, pm)
+    fake[p] = {name = name, parent = parent, key = key}
+    return p
+end
+
+pm.__index = function(p, k)
+    local n = fake[p].name
+    if type(k) == "string" and k:find("^[%a_][%w_]*$") then
+        n = n .. "." .. k
+    else
+        n = n .. "[" .. fmt(k) .. "]"
+    end
+    return proxy(n, p, k)
+end
+
+pm.__newindex = function(p, k, v)
+    emit(fake[pm.__index(p, k)].name .. " = " .. fmt(v))
+end
+
+pm.__call = function(p, ...)
+    tick()
+    local i, a, n = fake[p], {...}, select("#", ...)
+    local callee, from = i.name, 1
+    if i.parent and n > 0 and a[1] == i.parent and type(i.key) == "string" then
+        callee = fake[i.parent].name .. ":" .. i.key
+        from = 2
+    end
+    if S.mode == 2 and from == 2 and i.parent == roots.game and (i.key == "HttpGet" or i.key == "HttpGetAsync") and type(a[2]) == "string" then
+        local body
+        S.mute = true
+        pcall(function() body = game:HttpGet(a[2]) end)
+        S.mute = false
+        if type(body) == "string" then
+            emit("local layer" .. addl("http " .. a[2], body) .. " = " .. callee .. "(" .. fmt(a[2]) .. ")")
+            return body
+        end
+    end
+    local t = {}
+    for j = from, n do t[#t + 1] = fmt(a[j]) end
+    cnt.v = cnt.v + 1
+    local name = "v" .. cnt.v
+    emit("local " .. name .. " = " .. callee .. "(" .. table.concat(t, ", ") .. ")")
+    return proxy(name)
+end
+
+for k, s in pairs({add = "+", sub = "-", mul = "*", div = "/", mod = "%", pow = "^", idiv = "//", concat = ".."}) do
+    pm["__" .. k] = function(a, b)
+        return proxy("(" .. fmt(a) .. " " .. s .. " " .. fmt(b) .. ")")
+    end
+end
+pm.__unm = function(a) return proxy("(-" .. fmt(a) .. ")") end
+pm.__tostring = function(p) return fake[p].name end
+pm.__len = function() return 0 end
+pm.__lt = function() return false end
+pm.__le = function() return false end
+
+local function logfn(name)
+    return function(...) emit(name .. "(" .. args(...) .. ")") end
+end
+
+local function nap()
+    tick()
+    return 0
+end
+
+local function fire(f, ...)
+    tick()
+    if type(f) == "function" then return f(...) end
+end
+
+local sandbox = {}
+local keep = {
+    string = string, table = table, math = math, bit32 = bit32, utf8 = utf8,
+    buffer = buffer, coroutine = coroutine,
+    os = {time = os.time, clock = os.clock, date = os.date},
+    pairs = pairs, ipairs = ipairs, next = next, select = select, type = type,
+    tostring = tostring, tonumber = tonumber, unpack = unpack or table.unpack,
+    pcall = pcall, xpcall = xpcall, error = error, assert = assert,
+    rawget = rawget, rawset = rawset, rawequal = rawequal, rawlen = rawlen,
+    setmetatable = setmetatable, getmetatable = getmetatable,
+    print = logfn("print"), warn = logfn("warn"), wait = nap, spawn = fire
+}
+keep.delay = function(_, f, ...) return fire(f, ...) end
+keep.task = {wait = nap, spawn = fire, defer = fire, delay = keep.delay}
+keep.typeof = function(v)
+    if fake[v] then return "Instance" end
+    return tof(v)
+end
+keep.getfenv = function() return sandbox end
+keep.setfenv = function(f) return f end
+keep._G, keep._ENV = sandbox, sandbox
+keep.loadstring = loader(sandbox)
+
+setmetatable(sandbox, {__index = function(_, k)
+    local v = keep[k]
+    if v ~= nil then return v end
+    local r = roots[k]
+    if not r then
+        r = proxy(tostring(k))
+        roots[k] = r
+    end
+    return r
+end})
+
+local overlay, special = {}, {}
+setmetatable(overlay, {__index = function(_, k)
+    local v = special[k]
+    if v ~= nil then return v end
+    return G[k]
+end})
+
+special.loadstring = loader(overlay)
+special.getgenv = function() return overlay end
+special.getfenv = function(l)
+    if type(l) == "function" then return getfenv(l) end
+    return overlay
+end
+
+special.Instance = setmetatable({
+    new = wrap(function(c, p)
+        local o = RI.new(c, p)
+        if S.on and not S.mute then
+            cnt.i = (cnt.i or 0) + 1
+            refs[o] = "i" .. cnt.i
+            emit("local i" .. cnt.i .. " = Instance.new(" .. fmt(c) .. (p and (", " .. fmt(p)) or "") .. ")")
+        end
+        return o
+    end)
+}, {__index = RI})
+
+local function spy(n)
+    local f = G[n]
+    if type(f) ~= "function" then return end
+    special[n] = wrap(function(...)
+        if S.on and not S.mute then emit(n .. "(" .. args(...) .. ")") end
+        return f(...)
+    end)
+end
+for n in ("print warn setclipboard toclipboard queue_on_teleport queueonteleport writefile appendfile readfile delfile makefolder isfile isfolder listfiles loadfile dofile require firesignal fireclickdetector fireproximityprompt firetouchinterest getconnections identifyexecutor getexecutorname setfpscap"):gmatch("%S+") do
+    spy(n)
+end
+
+local function spyreq(f, label)
+    return wrap(function(o, ...)
+        local r = f(o, ...)
+        if S.on and not S.mute then
+            cnt.r = cnt.r + 1
+            local ok, line = pcall(function()
+                local s = label .. "(" .. fmt(o) .. ")"
+                if type(r) == "table" and type(r.Body) == "string" then
+                    local u = type(o) == "table" and (o.Url or o.url) or ""
+                    return "local layer" .. addl("http " .. tostring(u), r.Body) .. " = " .. s .. ".Body"
+                end
+                return "local r" .. cnt.r .. " = " .. s
+            end)
+            if ok then emit(line) end
+        end
+        return r
+    end)
+end
+for _, n in ipairs({"request", "http_request"}) do
+    if type(G[n]) == "function" then special[n] = spyreq(G[n], n) end
+end
+for _, n in ipairs({"syn", "http"}) do
+    local t = G[n]
+    if type(t) == "table" and type(t.request) == "function" then
+        special[n] = setmetatable({request = spyreq(t.request, n .. ".request")}, {__index = t})
+    end
+end
+
+local function ours(i)
+    local c = i
+    while c do
+        if c == gui then return true end
+        c = c.Parent
+    end
+    return false
+end
+
+local BIND = {GetService = 1, FindFirstChild = 1, FindFirstChildOfClass = 1, FindFirstChildWhichIsA = 1, FindFirstAncestor = 1, Clone = 1}
+
+local H = G.__deob
+if not H then
+    H = {}
+    G.__deob = H
+    if hookmetamethod and getnamecallmethod then
+        pcall(function()
+            local nc, ni
+            nc = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+                local f = H.nc
+                if f then return f(nc, self, ...) end
+                return nc(self, ...)
+            end))
+            ni = hookmetamethod(game, "__newindex", wrap(function(self, k, v)
+                local f = H.ni
+                if f then return f(ni, self, k, v) end
+                return ni(self, k, v)
+            end))
+        end)
+    end
+end
+
+H.nc = function(old, self, ...)
+    local m = getnamecallmethod()
+    if not S.on or S.mute or not chk() or ours(self) then return old(self, ...) end
+    if self == game and (m == "HttpGet" or m == "HttpGetAsync") then
+        local url = ...
+        setm(m)
+        local body = old(self, ...)
+        if type(body) == "string" then
+            local ok, s = pcall(function()
+                return "local layer" .. addl("http " .. tostring(url), body) .. " = game:" .. m .. "(" .. fmt(url) .. ")"
+            end)
+            if ok then emit(s) end
+        end
+        return body
+    end
+    local ok, s = pcall(function(...)
+        return fmt(self) .. ":" .. tostring(m) .. "(" .. args(...) .. ")"
+    end, ...)
+    setm(m)
+    if not BIND[m] then
+        if ok then emit(s) end
+        return old(self, ...)
+    end
+    local r = old(self, ...)
+    if ok then
+        if tof(r) == "Instance" and not refs[r] then
+            cnt.g = cnt.g + 1
+            refs[r] = "g" .. cnt.g
+            s = "local g" .. cnt.g .. " = " .. s
+        end
+        emit(s)
+    end
+    return r
+end
+
+H.ni = function(old, self, k, v)
+    if S.on and not S.mute and chk() and not ours(self) then
+        local ok, s = pcall(function()
+            return fmt(self) .. "." .. tostring(k) .. " = " .. fmt(v)
+        end)
+        if ok then emit(s) end
+    end
+    return old(self, k, v)
+end
+
+local function snap()
+    local s = {}
+    for _, v in ipairs(getgc(true)) do
+        local t = type(v)
+        if t == "table" or t == "function" then s[v] = true end
+    end
+    return s
+end
+
+local function sweep(before)
+    local all = getgc(true)
+    local seen, out = {}, {}
+    local getc = (debug and debug.getconstants) or getconstants
+    local function take(s)
+        if type(s) == "string" and #s >= 3 and #s <= 1500 and not seen[s] and utf8.len(s) and not s:find("[\1-\8\14-\31]") and not s:find("\0", 1, true) then
+            seen[s] = true
+            out[#out + 1] = s
+        end
+    end
+    for _, v in ipairs(all) do
+        if #out >= 3000 then break end
+        if not before[v] then
+            local t = type(v)
+            if t == "table" then
+                pcall(function()
+                    local n = 0
+                    for k, x in next, v do
+                        take(k)
+                        take(x)
+                        n = n + 1
+                        if n > 4000 then break end
+                    end
+                end)
+            elseif t == "function" and getc then
+                pcall(function()
+                    for _, c in ipairs(getc(v)) do take(c) end
+                end)
+            end
+        end
+    end
+    return out
+end
+
+local function dump(found)
+    local urls, seen = {}, {}
+    local function grab(text)
+        for u in text:gmatch("https?://[%w%-%._~:/%?#@!%$&%*%+,;=%%]+") do
+            if not seen[u] then
+                seen[u] = true
+                urls[#urls + 1] = u
+            end
+        end
+    end
+    grab(table.concat(log, "\n"))
+    for _, l in ipairs(lay) do grab(l[2]) end
+    for _, s in ipairs(found) do grab(s) end
+    if #urls == 0 and #found == 0 then return nil end
+    local t = {"local urls = {"}
+    for _, u in ipairs(urls) do t[#t + 1] = "    " .. quote(u) .. "," end
+    t[#t + 1] = "}"
+    if #found > 0 then
+        t[#t + 1] = ""
+        t[#t + 1] = "local strings = {"
+        for _, s in ipairs(found) do t[#t + 1] = "    " .. quote(s) .. "," end
+        t[#t + 1] = "}"
+    end
+    return table.concat(t, "\n")
+end
+
+local function squash(t)
+    local o, i = {}, 1
+    while i <= #t do
+        local j = i
+        while t[j + 1] == t[i] do j = j + 1 end
+        if j > i and not t[i]:find("^local ") then
+            o[#o + 1] = "for _ = 1, " .. (j - i + 1) .. " do " .. t[i] .. " end"
+        else
+            for k = i, j do o[#o + 1] = t[k] end
+        end
+        i = j + 1
+    end
+    return o
+end
+
+local function build(found)
+    vs = {{"trace", table.concat(squash(log), "\n")}}
+    for k, l in ipairs(lay) do
+        vs[#vs + 1] = {"layer" .. k .. " " .. l[1], l[2], true}
+    end
+    local s = dump(found)
+    if s then vs[#vs + 1] = {"strings", s} end
+    vi = #lay > 0 and #lay + 1 or 1
+    pi = 1
+    render()
+end
+
+local function reset()
+    log, lay, lidx = {}, {}, {}
+    refs = setmetatable({}, {__mode = "k"})
+    fake = setmetatable({}, {__mode = "k"})
+    roots = {}
+    for k in pairs(cnt) do cnt[k] = 0 end
+end
+
+local function execute(src)
+    local live = S.mode == 3
+    if src:sub(1, 4) == "http" then
+        say("fetching")
+        S.mute = true
+        local ok, body = pcall(function() return game:HttpGet(src) end)
+        S.mute = false
+        if not ok then return say("fetch failed") end
+        src = body
+    end
+    local f, e = L(src)
+    if not f then return say("compile failed: " .. tostring(e)) end
+    local before = S.gc and getgc and snap()
+    pcall(setfenv, f, live and overlay or sandbox)
+    if live and not (hookmetamethod and getnamecallmethod) then
+        say("live, no hookmetamethod, instance calls not logged")
+    else
+        say(live and "live, running for real" or "running in sandbox")
+    end
+    S.on = true
+    local done = false
+    task.spawn(function()
+        local ok, err = pcall(f)
+        if not ok then emit("error(" .. quote(tostring(err)) .. ")") end
+        done = true
+    end)
+    local t0, td = os.clock(), nil
+    while not S.stop and os.clock() - t0 < (live and WINDOW or 6) do
+        if done then
+            td = td or os.clock()
+            if os.clock() - td >= (live and 3 or 0) then break end
+        end
+        task.wait(0.1)
+    end
+    S.on = false
+    local found = {}
+    if before then
+        say("scanning gc")
+        found = sweep(before)
+    end
+    build(found)
+    say((done and "done  " or "done, still running  ") .. #log .. " calls  " .. #lay .. " layers")
+end
+
+runB.MouseButton1Click:Connect(function()
+    if S.run then
+        S.stop = true
+        return
+    end
+    if inp.Text == "" then return say("paste a link or source first") end
+    S.run, S.stop = true, false
+    runB.Text = "stop"
+    reset()
+    task.spawn(function()
+        local ok, err = pcall(execute, inp.Text)
+        if not ok then say("error: " .. tostring(err)) end
+        S.on, S.run = false, false
+        runB.Text = "run"
+    end)
+end)
+
+modeB.MouseButton1Click:Connect(function()
+    S.mode = S.mode % 3 + 1
+    modeB.Text = MODES[S.mode]
+end)
+
+gcB.MouseButton1Click:Connect(function()
+    S.gc = not S.gc
+    gcB.Text = S.gc and "gc on" or "gc off"
+end)
+
+tidyB.MouseButton1Click:Connect(function()
+    S.tidy = not S.tidy
+    tidyB.Text = S.tidy and "tidy on" or "tidy off"
+    render()
+end)
+
+prev.MouseButton1Click:Connect(function() step(-1) end)
+nxt.MouseButton1Click:Connect(function() step(1) end)
+
+label.MouseButton1Click:Connect(function()
+    vi, pi = vi % #vs + 1, 1
+    render()
+end)
+
+copyB.MouseButton1Click:Connect(function()
+    local f = setclipboard or toclipboard or set_clipboard
+    if not f then return say("no clipboard fn, select the text by hand") end
+    local t = shown(vs[vi])
+    say(pcall(f, t) and ("copied " .. #t) or "copy failed")
+end)
+
+saveB.MouseButton1Click:Connect(function()
+    local n = (nameB.Text:gsub("[^%w_%-%.]", "_"))
+    if n == "" then n = "deobfuscated" end
+    if not n:find("%.lua$") then n = n .. ".lua" end
+    say(pcall(writefile, n, shown(vs[vi])) and ("saved " .. n) or "save failed")
+end)
+
+close.MouseButton1Click:Connect(function()
+    H.nc, H.ni = nil, nil
+    S.on = false
+    mv:Disconnect()
+    gui:Destroy()
+end)
+
+render()
